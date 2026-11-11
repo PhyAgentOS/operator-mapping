@@ -1,0 +1,5 @@
+ros_domain_id: 91
+session_dir: /tmp/navigation-mapping
+session_id: mapping-example
+backend_params: /opt/navigation/config/slam.yaml
+pcd_path: /tmp/navigation-mapping/lio_map.pcd
