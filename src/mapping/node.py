@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import time
@@ -17,6 +18,9 @@ from mapping.process import OwnedProcess
 
 
 def run(cfg: dict) -> None:
+    from .backend import materialize
+
+    cfg = materialize(cfg)
     import rclpy
     from nav_msgs.msg import OccupancyGrid
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -25,6 +29,11 @@ def run(cfg: dict) -> None:
 
     rclpy.init(domain_id=cfg["ros_domain_id"])
     ros = rclpy.create_node("forge_mapping_policy")
+    from tf2_ros import Buffer, TransformListener
+
+    buffer = Buffer()
+    _listener = TransformListener(buffer, ros)
+    last_snapshot = 0.0
     dora = Node()
     backend = OwnedProcess()
     root = Path(cfg["session_dir"]).resolve()
@@ -68,8 +77,14 @@ def run(cfg: dict) -> None:
             ).to_arrow(),
         )
 
+    from .snapshot import grid_value, write_snapshot
+
+    snapshot_dir = cfg.get("snapshot_dir")
+
     def on_map(msg):
         nonlocal latest_map, state, pending
+        if snapshot_dir:
+            write_snapshot(snapshot_dir, "map", grid_value(msg))
         if state not in ("starting", "running"):
             return
         if msg.info.width * msg.info.height != len(msg.data) or not any(v >= 0 for v in msg.data):
@@ -292,6 +307,27 @@ def run(cfg: dict) -> None:
                     emit(command, "rejected", "unsupported command")
             for _ in range(4):
                 rclpy.spin_once(ros, timeout_sec=0)
+            if snapshot_dir and time.monotonic() - last_snapshot > 0.2:
+                try:
+                    tf = buffer.lookup_transform(
+                        cfg.get("map_frame", "map"),
+                        cfg.get("base_frame", "base_link"),
+                        rclpy.time.Time(),
+                    )
+                    p, q = tf.transform.translation, tf.transform.rotation
+                    stamp = tf.header.stamp.sec + tf.header.stamp.nanosec / 1e9
+                    if abs(ros.get_clock().now().nanoseconds / 1e9 - stamp) < 1.5:
+                        write_snapshot(
+                            snapshot_dir,
+                            "pose",
+                            {
+                                "pose": [p.x, p.y, 2 * math.atan2(q.z, q.w)],
+                                "frame_id": cfg.get("map_frame", "map"),
+                            },
+                        )
+                except Exception:
+                    pass  # No map transform during backend startup.
+                last_snapshot = time.monotonic()
             if state in ("starting", "running") and backend.poll() is not None:
                 raise RuntimeError("mapping backend exited unexpectedly")
             if state == "starting" and time.monotonic() > deadline:
