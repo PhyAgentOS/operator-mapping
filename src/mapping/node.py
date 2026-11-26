@@ -17,21 +17,37 @@ from mapping.map_io import GridSnapshot
 from mapping.process import OwnedProcess
 
 
+def owns_active_backend(state, backend):
+    """Unstarted OwnedProcess.poll() is also None; require explicit ownership."""
+    return (
+        state in ("starting", "running")
+        and backend.process is not None
+        and backend.poll() is None
+    )
+
+
 def run(cfg: dict) -> None:
-    from .backend import materialize
+    from .backend import backend_environment, materialize
 
     cfg = materialize(cfg)
     import rclpy
     from nav_msgs.msg import OccupancyGrid
+    from rclpy.parameter import Parameter
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from slam_toolbox.srv import SerializePoseGraph
     from std_srvs.srv import Trigger
 
     rclpy.init(domain_id=cfg["ros_domain_id"])
-    ros = rclpy.create_node("forge_mapping_policy")
+    simulation_time = cfg.get("use_sim_time", False)
+    if not isinstance(simulation_time, bool):
+        raise ValueError("use_sim_time must be a boolean")
+    ros = rclpy.create_node(
+        "forge_mapping_policy",
+        parameter_overrides=[Parameter("use_sim_time", value=simulation_time)],
+    )
     from tf2_ros import Buffer, TransformListener
 
-    buffer = Buffer()
+    buffer = Buffer(node=ros) if simulation_time else Buffer()
     _listener = TransformListener(buffer, ros)
     last_snapshot = 0.0
     dora = Node()
@@ -83,12 +99,14 @@ def run(cfg: dict) -> None:
 
     def on_map(msg):
         nonlocal latest_map, state, pending
-        if snapshot_dir:
-            write_snapshot(snapshot_dir, "map", grid_value(msg))
-        if state not in ("starting", "running"):
+        # An idle mapping node can still hear AMCL's /map in the same graph.
+        # Only its own live SLAM backend is allowed to publish mapping snapshots.
+        if not owns_active_backend(state, backend):
             return
         if msg.info.width * msg.info.height != len(msg.data) or not any(v >= 0 for v in msg.data):
             return
+        if snapshot_dir:
+            write_snapshot(snapshot_dir, "map", grid_value(msg))
         latest_map = msg
         if state == "starting":
             state = "running"
@@ -182,6 +200,8 @@ def run(cfg: dict) -> None:
             for name in ("frame_alignment.json", "trajectory.json"):
                 if (root / name).is_file():
                     shutil.copy2(root / name, folder / name)
+            if cfg.get('seed_provenance'):
+                (folder/'seed-provenance.json').write_text(json.dumps(cfg['seed_provenance'],indent=2))
             manifest = {
                 "map_id": cfg["session_id"],
                 "version": save_id,
@@ -199,6 +219,9 @@ def run(cfg: dict) -> None:
                 "warnings": warnings,
                 "files": [],
             }
+            if cfg.get('seed_provenance'):
+                manifest['seed_provenance']=cfg['seed_provenance']
+                manifest['pcd_scope']='current session raw LIO only; parent raw PCD remains in the recorded source archive'
             for file in sorted(folder.iterdir()):
                 with file.open("rb") as stream:
                     digest = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -271,11 +294,11 @@ def run(cfg: dict) -> None:
                             "slam_toolbox",
                             "online_async_launch.py",
                             "slam_params_file:=" + cfg["backend_params"],
-                            "use_sim_time:=false",
+                            "use_sim_time:=" + str(simulation_time).lower(),
                         ],
                         cwd=root,
                         log_path=root / "slam_toolbox.log",
-                        env={**os.environ, "ROS_DOMAIN_ID": str(cfg["ros_domain_id"])},
+                        env=backend_environment(cfg,os.environ),
                     )
                     emit(command, "running", "awaiting first valid 2D map")
                 elif command.command == "save":
@@ -307,7 +330,11 @@ def run(cfg: dict) -> None:
                     emit(command, "rejected", "unsupported command")
             for _ in range(4):
                 rclpy.spin_once(ros, timeout_sec=0)
-            if snapshot_dir and time.monotonic() - last_snapshot > 0.2:
+            if (
+                snapshot_dir
+                and owns_active_backend(state, backend)
+                and time.monotonic() - last_snapshot > 0.2
+            ):
                 try:
                     tf = buffer.lookup_transform(
                         cfg.get("map_frame", "map"),
