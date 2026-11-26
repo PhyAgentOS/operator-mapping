@@ -1,9 +1,26 @@
 """Materialize optional ROS backend parameter overrides without changing source files."""
 
 import copy
+import hashlib
 from pathlib import Path
 
 import yaml
+
+
+def backend_environment(config, environment):
+    result = dict(environment)
+    result["ROS_DOMAIN_ID"] = str(config["ros_domain_id"])
+    if config.get("backend_preload_library"):
+        root = Path(config["deployment_root"]).resolve()
+        library = Path(config["backend_preload_library"]).resolve()
+        if not library.is_relative_to(root) or not library.is_file():
+            raise ValueError("backend preload must stay in explicit deployment root")
+        if hashlib.sha256(library.read_bytes()).hexdigest() != config.get("backend_preload_sha256"):
+            raise ValueError("backend preload library hash differs")
+        if result.get("LD_PRELOAD") and result["LD_PRELOAD"] != str(library):
+            raise ValueError("unvalidated inherited backend preload")
+        result["LD_PRELOAD"] = str(library)
+    return result
 
 
 def materialize(config):
